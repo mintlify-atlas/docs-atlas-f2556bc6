@@ -1,0 +1,99 @@
+---
+title: "Kernel architecture and design"
+description: "FlashQLA's TileLang warp-specialized fused kernel design for GDN forward and backward passes on NVIDIA Hopper, with hardware-friendly algebraic reformulation."
+---
+
+FlashQLA decomposes the GDN Chunked Prefill operation into a small set of tightly fused TileLang kernels rather than the larger collection of independent Triton kernels used by the FLA baseline. Each kernel is written in [TileLang](https://github.com/tile-ai/tilelang) and manually implements warpgroup specialization to overlap data movement, Tensor Core computation, and CUDA Core computation on NVIDIA Hopper's SM90 architecture.
+
+## Kernel inventory
+
+The following kernels are exported from `flash_qla.ops.gated_delta_rule.chunk.hopper`:
+
+<CardGroup cols={2}>
+  <Card title="fused_gdr_fwd" icon="play">
+    Fused forward kernel. Combines recurrent state propagation and output projection into a single pass. Reads `q`, `k`, `v`, `A`, `g`, `beta` and writes `o`, optional `h` (per-chunk states), and `final_state`.
+  </Card>
+  <Card title="fused_gdr_bwd" icon="rotate-ccw">
+    Fused backward kernel. Takes pre-computed per-chunk states `h` and computes gradients `dq`, `dk`, `dv`, `dg`, `dbeta`, and `dh_0` in a single pass.
+  </Card>
+  <Card title="fused_gdr_h" icon="database">
+    State-only forward kernel. Propagates the recurrent state without computing the output projection. Used in two contexts: backward recomputation (to regenerate `h` without storing it in the forward pass) and CP preprocessing (to compute boundary states for sub-sequence stitching).
+  </Card>
+  <Card title="kkt_solve" icon="calculator">
+    Solves the KKT linear system for the per-chunk A matrix from `k` and `beta`. Implements a blocked LU factorization specialized for 64×64 lower-triangular systems using warp-level matrix inversions.
+  </Card>
+  <Card title="get_warmup_chunks" icon="thermometer">
+    CP preprocessing kernel. Scans each sub-sequence tail-to-head, accumulating cumulative gate values, to determine how many trailing chunks are needed for the initial state influence to fall below `warmup_threshold`.
+  </Card>
+  <Card title="correct_initial_states" icon="wrench">
+    CP preprocessing kernel. Propagates the user-supplied `h_0` through the boundary states computed by `fused_gdr_h` to produce corrected initial states for each CP sub-sequence.
+  </Card>
+</CardGroup>
+
+## Comparison with the FLA Triton approach
+
+The FLA Triton baseline decomposes GDN into five separate kernel launches. FlashQLA reduces this to three by fusing the key computation steps:
+
+| Step | FLA (Triton) | FlashQLA (TileLang) |
+|------|-------------|----------------------|
+| Gate cumulative sum | `csum` kernel | `csum` kernel (shared) |
+| KKT solve | `kkt_solve` kernel | `kkt_solve` kernel (fused, warp-specialized) |
+| State write-up | `wu` kernel | — fused into `fused_gdr` |
+| GDN recurrence | `gdr` kernel | — fused into `fused_gdr` |
+| Output projection | `o` kernel | — fused into `fused_gdr` |
+| **Total launches** | **5** | **3** |
+
+Fusing `wu`, `gdr`, and `o` into `fused_gdr_fwd` eliminates two round-trips through global memory per chunk, which is a dominant cost at small head counts and long sequences.
+
+## Warpgroup specialization
+
+Each fused kernel assigns different warpgroups to distinct hardware responsibilities and overlaps them with TMA-based asynchronous copy:
+
+- **Producer warpgroup** (threads 384–511, `PRODUCER_NREG=32`): issues TMA async copies of `q`, `k`, `v`, `A`, `g`, and `beta` from global memory into shared memory double buffers. Uses minimal registers to leave more register file space for consumers.
+- **Consumer-S warpgroup** (threads 0–127, `CONSUMER_S_NREG=160`): owns the recurrent state fragment `h_fragment` in registers. Uses Tensor Core GEMMs (`gemm_v1`) for the state update `h += K^T @ V'` and the gate scale `h *= exp(g_last)`.
+- **Consumer-V warpgroup** (threads 128–255, `CONSUMER_V_NREG=128`): computes the delta value `W = V - exp(g) · (K @ h)` and the gated value `V' = (g_last/g) · A @ W`. Uses CUDA Core element-wise ops for gate scaling and Tensor Core GEMMs for the matrix products.
+- **Consumer-O warpgroup** (threads 256–383, `CONSUMER_O_NREG=128`): computes the output `O = scale · exp(g) · Q @ h + scale · G * P @ Vd`. Uses Tensor Core for `Q @ h` and `P @ Vd`, CUDA Core for gate masking.
+
+The double-buffered barrier scheme (`data_is_ready`, `data_is_free`) ensures that data movement and computation are pipelined across consecutive chunks.
+
+## Hardware unit usage
+
+FlashQLA's algebraic reformulation reduces the number of operations required on each hardware unit:
+
+**Tensor Cores** handle all matrix multiply-accumulate operations:
+- `K @ K^T` in `kkt_solve` (for the A matrix)
+- `K^T @ V'` for state updates
+- `Q @ h` for output from state
+- `P @ Vd` for intra-chunk attention output
+
+**CUDA Cores** handle element-wise operations:
+- Gate masking: `g_exp = exp2(g * log2e)`, `g_rev_exp = exp2((g_last - g) * log2e)`
+- Gate-weighted beta application: `A[s,t] *= g_fragment[s,t] * beta[t]`
+- Delta subtraction: `W = V - g_exp * U`
+
+**SFUs (Special Function Units)** are used for `exp2()` in gate conversion. The algebraic reformulation reduces SFU calls by working in log-domain (`g` is stored and passed as log-gate values) and converting to linear scale only where required inside the kernel.
+
+## Fixed chunk size
+
+The chunk size is hardcoded to **64 tokens** throughout the implementation. Both `kkt_solve` and `fused_gdr_fwd` assert `chunk_size == 64`:
+
+```python
+assert chunk_size == 64  # hardcoded in fused_fwd.py and kkt_solve.py
+```
+
+This allows the 64×64 KKT inversion to be fully unrolled and the shared memory tile sizes to be compile-time constants, which is required for TileLang's JIT specialization.
+
+## Hardware requirements
+
+<Note>
+FlashQLA requires **SM90 (NVIDIA Hopper) or above**. The module raises a `ValueError` at import time on any other architecture:
+
+```python
+if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
+    from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
+else:
+    raise ValueError("FlashQLA now support sm90 only.")
+```
+
+CUDA 12.8 and PyTorch 2.8 or above are also required.
+</Note>

@@ -1,0 +1,102 @@
+---
+title: "What is the Gated Delta Rule?"
+description: "The GDN chunked prefill algorithm: chunk-based recurrent computation with exponential gate decay and delta update rule for Qwen linear attention."
+---
+
+GDN (Gated Delta Network) Chunked Prefill is the linear attention mechanism at the core of the Qwen3.5 and Qwen3.6 model families. Rather than materializing a full `T×T` attention matrix, GDN maintains a fixed-size recurrent state `h` that summarizes past tokens. FlashQLA provides a high-performance implementation of the GDN forward and backward passes that achieves 2–3× speedup over the FLA Triton baseline on NVIDIA Hopper GPUs.
+
+## Mathematical intuition
+
+GDN is a linear attention variant that replaces the softmax attention kernel with a recurrent formulation. At each step, the model updates a hidden state `h ∈ ℝ^{K×V}` using a combination of two mechanisms:
+
+- **Exponential gate decay** — a scalar gate `g` (in log-domain) controls how quickly the contribution of previous tokens fades. Each chunk multiplies the accumulated state by `exp(g_last)`, where `g_last` is the cumulative gate value at the end of the chunk. Because `g` comes from `logsigmoid`, it is always negative, so old memory decays monotonically.
+- **Delta update rule** — at each token, a key-value outer product `k^T · v` is written into the state weighted by `beta` (the write strength). The "delta" part subtracts the existing state projection before writing, ensuring each key slot holds the most recent value associated with that key.
+
+## Chunked processing
+
+FlashQLA splits the input sequence into non-overlapping chunks of exactly **64 tokens**. This chunk size is hardcoded and must be satisfied; the sequence is padded to the next multiple of 64 if needed.
+
+For each chunk `c`:
+
+1. **Intra-chunk attention** — standard causal attention is computed within the chunk using the gated attention matrix.
+2. **Cross-chunk state propagation** — the recurrent state `h` is carried from chunk `c-1` into chunk `c` after being scaled by the cumulative gate.
+
+The outer loop over chunks is fused into a single kernel pass, so state propagation and output projection are computed simultaneously without materializing intermediate states to global memory.
+
+## KKT solve: the A matrix
+
+Before the forward pass runs, `kkt_solve` computes a per-chunk lower-triangular matrix `A ∈ ℝ^{T×H_v×chunk\_size}` from the key tensor `k` and `beta`. The system solved is:
+
+```
+A = (I + StrictLower(beta · K @ K^T))^{-1}
+```
+
+This is a KKT-style linear system whose solution gives the exact intra-chunk inter-sequence influence matrix. The inverse is computed in-kernel via a blocked LU factorization specialized for 64×64 lower-triangular systems.
+
+```python
+from flash_qla import chunk_gated_delta_rule_fwd
+
+g, A, o, h, final_state = chunk_gated_delta_rule_fwd(
+    q, k, v, g, beta, scale=scale, initial_state=h0
+)
+```
+
+`A` is returned from `chunk_gated_delta_rule_fwd` and passed directly to `chunk_gated_delta_rule_bwd` — you do not need to recompute it.
+
+## Tensor shapes
+
+| Tensor | Shape | Notes |
+|--------|-------|-------|
+| `q`, `k` | `[B, T, H_q, K]` | Query and key, K = 128 |
+| `v` | `[B, T, H_v, V]` | Value, V = 128 |
+| `g` | `[B, T, H_v]` | Log-domain gate (from `logsigmoid`), values are negative |
+| `beta` | `[B, T, H_v]` | Write strength from `sigmoid`, values in `[0, 1]` |
+| `initial_state` / `h` | `[B, H_v, K, V]` | Recurrent state |
+| `A` | `[B, T, H_v, chunk_size]` | KKT solution matrix (chunk_size=64), one row per token |
+
+`g` is passed as raw (non-cumulative) log-gate values. The chunked cumulative sum is computed internally by `chunk_local_cumsum` at the start of `chunk_gated_delta_rule_fwd`.
+
+## Parameters
+
+**`scale`** — query scaling factor applied to the attention scores. Defaults to `K ** -0.5` (i.e., `1 / sqrt(128) ≈ 0.0884`). Pass an explicit value to override.
+
+**`beta`** — the per-token write coefficient. A value of `1.0` fully replaces the existing key slot; `0.0` performs no write. In practice, `beta = sigmoid(...)` keeps values in `(0, 1)`.
+
+**`initial_state`** — optional starting hidden state `h_0`. If omitted, the state is initialized to zero. When processing stateful inference in chunks, pass the `final_state` from the previous call.
+
+## GQA (grouped-query attention)
+
+FlashQLA supports grouped-query attention: `H_v` must be an integer multiple of `H_q`. Each query head shares key/gate projections with the corresponding group of value heads.
+
+```python
+assert v.shape[2] % k.shape[2] == 0, "H_v must be divisible by H_q"
+```
+
+The grouping ratio `H_v // H_q` is derived automatically from the tensor shapes.
+
+## Variable-length sequences
+
+Pass `cu_seqlens` (a `torch.LongTensor` of shape `[N+1]` with cumulative token counts) to process a batch of sequences with different lengths in a single call. When `cu_seqlens` is provided, the batch dimension must be 1 and all sequences are packed into the token dimension.
+
+```python
+o, final_state = chunk_gated_delta_rule(
+    q=q,           # [1, total_tokens, H_q, K]
+    k=k,
+    v=v,
+    g=g,
+    beta=beta,
+    cu_seqlens=cu_seqlens,  # e.g. tensor([0, 512, 1024, 2048])
+)
+```
+
+<Note>
+When `cu_seqlens` is used, `initial_state` must have shape `[N, H_v, K, V]` where `N = len(cu_seqlens) - 1` — one state per sequence, not one per batch entry.
+</Note>
+
+## dtype
+
+<Warning>
+`float32` is not supported. Pass `bfloat16` or `float16` tensors. The function will raise an assertion error if `q.dtype == torch.float32`.
+</Warning>
+
+The recurrent state `h` is always accumulated in `float32` internally for numerical stability, regardless of the input dtype.

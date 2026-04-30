@@ -1,133 +1,78 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "FlashQLA: High-Performance Linear Attention Kernels"
+description: "FlashQLA delivers 2-3x forward and 2x backward speedups for GDN Chunked Prefill on NVIDIA Hopper GPUs via TileLang-fused warp-specialized kernels."
 ---
 
-## Setting up
+FlashQLA is a high-performance linear attention kernel library built on [TileLang](https://github.com/tile-ai/tilelang), targeting NVIDIA Hopper (SM90) GPUs. It implements fused, warp-specialized CUDA kernels for the Gated Delta Rule (GDN) attention mechanism, achieving **2-3x forward** and **2x backward** speedup over the FLA Triton baseline across the Qwen3.5/Qwen3.6 model family.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install FlashQLA from source with pip and verify your CUDA/PyTorch environment.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Run your first GDN Chunked Prefill forward pass in under five minutes.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Concepts" icon="book-open" href="/concepts/gated-delta-rule">
+    Understand the Gated Delta Rule, intra-card context parallelism, and kernel architecture.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/chunk-gated-delta-rule">
+    Explore the full public API: high-level, low-level, and utility functions.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why FlashQLA?
 
-Everything you need to create world-class documentation.
+FlashQLA addresses the performance bottleneck in linear attention inference and training for large language models. The Qwen3.5 and Qwen3.6 model families use a Gated Delta Rule attention mechanism that existing Triton kernels handle inefficiently. FlashQLA closes this gap through three complementary optimizations.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="Auto Context Parallelism" icon="arrows-split-up-and-left">
+    Gate-driven intra-card CP automatically splits long sequences under TP, improving SM utilization without manual configuration.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Algebraic Reformulation" icon="function">
+    Hardware-friendly math reduces Tensor Core, CUDA Core, and SFU overhead without sacrificing numerical precision.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Fused Warp Kernels" icon="microchip">
+    TileLang fused kernels with manual warpgroup specialization overlap data movement and computation.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+</CardGroup>
 
-## Make your content agent ready
+## Hardware requirements
 
-Make your docs work for humans and AI agents alike.
+<Note>
+FlashQLA currently requires NVIDIA Hopper architecture (SM90) or above. Ampere and earlier GPUs are not supported.
+</Note>
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+| Requirement | Minimum version |
+|---|---|
+| GPU architecture | SM90 (NVIDIA H100, H200) |
+| CUDA | 12.8 |
+| PyTorch | 2.8 |
+| Python | 3.10 |
 
-## Need inspiration?
+## Get started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install FlashQLA">
+    Clone the repository and install with pip:
+    ```bash
+    git clone https://github.com/QwenLM/FlashQLA.git
+    cd FlashQLA
+    pip install -v .
+    ```
+  </Step>
+  <Step title="Run your first forward pass">
+    Import `chunk_gated_delta_rule` and call it with your query, key, value, gate, and beta tensors:
+    ```python
+    import torch
+    from flash_qla import chunk_gated_delta_rule
+
+    o, final_state = chunk_gated_delta_rule(
+        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+        output_final_state=True,
+    )
+    ```
+  </Step>
+  <Step title="Explore advanced features">
+    Use variable-length sequences with `cu_seqlens`, access low-level forward/backward APIs, or run the benchmark suite to compare against FLA Triton and FlashInfer baselines.
+  </Step>
+</Steps>

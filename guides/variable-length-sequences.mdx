@@ -1,0 +1,131 @@
+---
+title: "Variable-length sequences with cu_seqlens"
+description: "Pack variable-length sequences into a single batch using cu_seqlens to avoid padding waste and run efficient GDN chunked prefill with FlashQLA."
+---
+
+Real-world inference workloads rarely arrive with uniform sequence lengths. Padding every sequence to the batch maximum wastes Tensor Core cycles proportional to the padding ratio, which grows sharply as length variance increases. FlashQLA supports a packed-batch layout controlled by the `cu_seqlens` argument, letting you process sequences of different lengths in a single kernel call with no padding.
+
+## The cu_seqlens format
+
+`cu_seqlens` is a 1-D integer tensor of shape `[num_seqs + 1]` holding the **cumulative token offsets** of each sequence in the packed batch. The first element is always `0` and the last element equals the total number of tokens.
+
+For three sequences with lengths `[3, 5, 2]`:
+
+```
+index:      0   1   2   3
+cu_seqlens: 0   3   8  10
+            └───┘   └── seq 0: tokens[0:3]
+                └───────┘── seq 1: tokens[3:8]
+                        └── seq 2: tokens[8:10]
+```
+
+Build `cu_seqlens` from a list of individual sequence lengths:
+
+```python
+import torch
+
+seqlens = [1024, 2048, 512]  # individual sequence lengths
+cu_seqlens = torch.tensor(
+    [0] + list(torch.cumsum(torch.tensor(seqlens), dim=0).tolist()),
+    dtype=torch.int32,
+    device="cuda",
+)
+# cu_seqlens: tensor([   0, 1024, 3072, 3584], dtype=torch.int32)
+```
+
+## Step 1 — Pack tensors into the flat layout
+
+Your input tensors start in padded form with shape `[B, max_len, H, D]`. Use the `pack` utility to strip padding and concatenate all sequences into a single `[1, total_tokens, H, D]` tensor.
+
+```python
+from flash_qla.utils import pack, unpack
+
+# q, k have shape [B, max_len, H_q, K]
+# v         shape [B, max_len, H_v, V]
+# g, beta   shape [B, max_len, H_v]
+
+q_packed    = pack(q,    cu_seqlens)   # [1, total_tokens, H_q, K]
+k_packed    = pack(k,    cu_seqlens)   # [1, total_tokens, H_q, K]
+v_packed    = pack(v,    cu_seqlens)   # [1, total_tokens, H_v, V]
+g_packed    = pack(g,    cu_seqlens)   # [1, total_tokens, H_v]
+beta_packed = pack(beta, cu_seqlens)   # [1, total_tokens, H_v]
+```
+
+`pack` reads `cu_seqlens` to know how many valid tokens each sequence contributes and ignores any trailing padding.
+
+## Step 2 — Run chunk_gated_delta_rule
+
+Pass the packed tensors together with `cu_seqlens`. The batch dimension of every packed tensor must be `1`.
+
+```python
+from flash_qla import chunk_gated_delta_rule
+
+o_packed, final_state = chunk_gated_delta_rule(
+    q=q_packed,
+    k=k_packed,
+    v=v_packed,
+    g=g_packed,
+    beta=beta_packed,
+    scale=scale,
+    initial_state=h0,        # optional: [num_seqs, H_v, K, V]
+    output_final_state=True,
+    cu_seqlens=cu_seqlens,
+)
+# o_packed shape:    [1, total_tokens, H_v, V]
+# final_state shape: [num_seqs, H_v, K, V]
+```
+
+When `output_final_state=True` and `cu_seqlens` is provided, `final_state` contains one recurrent state per sequence rather than one per batch element.
+
+## Step 3 — Unpack the output
+
+Restore the padded `[B, max_len, H_v, V]` layout with `unpack`:
+
+```python
+o = unpack(o_packed, cu_seqlens)  # [B, max_len, H_v, V]
+```
+
+`unpack` writes each sequence's output into the first `seqlen_i` positions of row `i` and zero-fills the remainder.
+
+## Passing an initial recurrent state
+
+When providing `initial_state`, its batch dimension must equal `num_seqs = len(cu_seqlens) - 1`, not the original batch size `B`:
+
+```python
+num_seqs = cu_seqlens.shape[0] - 1
+h0 = torch.zeros(
+    num_seqs, num_v_heads, head_dim_k, head_dim_v,
+    dtype=torch.float32,
+    device="cuda",
+)
+
+o_packed, final_state = chunk_gated_delta_rule(
+    q=q_packed,
+    k=k_packed,
+    v=v_packed,
+    g=g_packed,
+    beta=beta_packed,
+    scale=scale,
+    initial_state=h0,
+    output_final_state=True,
+    cu_seqlens=cu_seqlens,
+)
+```
+
+## Important constraints
+
+<Warning>
+  `batch_size` must be `1` when `cu_seqlens` is provided. Pack all sequences into a single flat tensor before calling `chunk_gated_delta_rule`.
+</Warning>
+
+<Warning>
+  `cu_seqlens` must start with `0` and end with the total number of tokens. Every sequence length (the gap between consecutive elements) must be strictly positive.
+</Warning>
+
+<Warning>
+  When `initial_state` is not `None`, its first dimension must be `num_seqs = len(cu_seqlens) - 1`, not `B`. Passing a tensor with `shape[0] != num_seqs` raises a `ValueError`.
+</Warning>
+
+## Auto context parallelism and cu_seqlens
+
+FlashQLA's gate-driven intra-card context parallelism (auto-CP) is active when `cu_seqlens` is provided and `batch_size=1`. For standard padded batches with `batch_size > 1` the auto-CP pass is bypassed. This means the variable-length path is also the optimal path for long single-sequence workloads: wrap a single sequence of length `T` in `cu_seqlens = [0, T]` to benefit from auto-CP.

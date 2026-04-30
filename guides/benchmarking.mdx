@@ -1,0 +1,91 @@
+---
+title: "Benchmarking FlashQLA performance"
+description: "Run the FlashQLA benchmark suite against FLA Triton and FlashInfer baselines on NVIDIA H200, covering forward and backward passes across Qwen3.5 configurations."
+---
+
+FlashQLA ships a self-contained benchmark script that measures forward and backward kernel latency against the FLA Triton baseline and, where available, the FlashInfer GDN kernel. The benchmark covers every head configuration used by the Qwen3.5 / Qwen3.6 model family and sweeps a representative set of sequence length distributions drawn from real pretraining and inference workloads.
+
+## Prerequisites
+
+Install both comparison libraries before running:
+
+```bash
+pip install flash_linear_attention==0.5.0 flashinfer-python==0.6.9
+```
+
+The benchmark was run with the following software stack on NVIDIA H200:
+
+| Package | Version |
+|---|---|
+| PyTorch | 2.9.1+cu128 |
+| flash_linear_attention | 0.5.0 |
+| Triton | 3.5.1 |
+| flashinfer-python | 0.6.9 |
+| TileLang | 0.1.8 |
+
+## Running the benchmark
+
+```bash
+cd benchmark
+python bench_gated_delta_rule.py
+```
+
+Optional flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mode <fwd\|bwd\|all>` | `all` | Run forward only, backward only, or both. |
+| `--warmup <N>` | `10` | Number of warmup iterations per configuration. |
+| `--repeats <N>` | `100` | Number of timed iterations per configuration. |
+| `--skip-fi` | off | Skip FlashInfer measurements (e.g., if not installed). |
+
+## What is benchmarked
+
+### Forward pass
+
+The forward benchmark measures single-kernel end-to-end latency across all model configurations and sequence length distributions. Inputs are packed with `cu_seqlens` (variable-length layout) and auto-CP is enabled. Three kernels are compared:
+
+- **FlashQLA** — TileLang fused warp-specialized kernel
+- **FLA** — Flash Linear Attention Triton kernel
+- **FlashInfer** — FlashInfer GDN prefill kernel (when available)
+
+Head configurations span `h_k,v ∈ {2/8, 4/16, 8/32, 16/64, 16/32, 8/24, 16/48, 16/16, 32/32}`, corresponding to TP8 through TP1 for the 397B/122B, 35B/9B/4B, 27B, and 2B/0.8B model sizes. All heads use `head_dim = 128`.
+
+Sequence length configurations include single sequences (1×32768 down to 1×2048), two-sequence batches with asymmetric splits (e.g., 28672+4096), and uniform multi-sequence batches (8192×4, 4096×8, 1024×8).
+
+### Backward pass
+
+The backward benchmark measures the total latency for one weight-update step (a single backward call) as total token count scales from 16k to 256k tokens. Each total token budget is split into 8 sequences with randomly sampled boundaries. Symmetric head configurations `h_k = h_v ∈ {32, 48, 64}` are used.
+
+## Example results — 397B/122B TP8 (h_qk=2, h_v=8)
+
+The table below shows a selection of forward results for the highest-TP configuration, where FlashQLA's speedup is most pronounced due to low head count and long sequences.
+
+| Sequence layout | FlashQLA | FlashInfer | FLA | vs FLA | vs FI |
+|---|---|---|---|---|---|
+| 1×32768 | 0.310 ms | 1.657 ms | 0.910 ms | 2.93× | 5.34× |
+| 1×16384 | 0.184 ms | 0.832 ms | 0.465 ms | 2.53× | 4.52× |
+| 1×8192 | 0.122 ms | 0.420 ms | 0.578 ms | 4.74× | 3.45× |
+| 1×4096 | 0.107 ms | 0.215 ms | 0.277 ms | 2.59× | 2.01× |
+| 1×2048 | 0.106 ms | 0.114 ms | 0.261 ms | 2.46× | 1.07× |
+| 28672+4096 | 0.304 ms | 1.449 ms | 0.841 ms | 2.77× | 4.77× |
+| 16384+16384 | 0.292 ms | 0.831 ms | 0.623 ms | 2.13× | 2.84× |
+| 8192×4 | 0.274 ms | 0.401 ms | 0.477 ms | 1.74× | 1.46× |
+| 1024×8 | 0.065 ms | 0.063 ms | 0.273 ms | 4.17× | 0.95× |
+
+<Tip>
+  Speedups are most pronounced at high tensor-parallelism degrees (small head counts) and long sequences, where FlashQLA's gate-driven intra-card context parallelism provides the greatest SM utilization improvement over the FLA Triton kernel.
+</Tip>
+
+## Example results — backward pass
+
+| Heads | Total tokens | FlashQLA | FLA | Speedup |
+|---|---|---|---|---|
+| 32 | 16k | 1.262 ms | 2.433 ms | 1.93× |
+| 32 | 128k | 9.489 ms | 18.195 ms | 1.92× |
+| 48 | 16k | 1.775 ms | 3.549 ms | 2.00× |
+| 48 | 256k | 31.321 ms | 56.344 ms | 1.80× |
+| 64 | 16k | 2.213 ms | 4.654 ms | 2.10× |
+| 64 | 256k | 34.310 ms | 74.392 ms | 2.17× |
+
+The complete benchmark results for all model configurations and sequence lengths are in [`benchmark/benchmark_results_H200.txt`](https://github.com/QwenLM/FlashQLA/blob/main/benchmark/benchmark_results_H200.txt) in the repository.

@@ -1,0 +1,146 @@
+---
+title: "chunk_gated_delta_rule_bwd"
+description: "Low-level backward pass for GDN Chunked Prefill. Computes gradients for q, k, v, beta, g, and initial_state given cached intermediates from the forward pass."
+---
+
+`chunk_gated_delta_rule_bwd` computes all gradients for the GDN operation. It requires the intermediate outputs from [`chunk_gated_delta_rule_fwd`](/api/chunk-gated-delta-rule-fwd) — specifically the cumsum-transformed gate `g` and the KKT matrix `A`. If you are using autograd, prefer the high-level [`chunk_gated_delta_rule`](/api/chunk-gated-delta-rule) which handles this automatically.
+
+```python
+from flash_qla import chunk_gated_delta_rule_bwd
+
+dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
+    q=q,
+    k=k,
+    v=v,
+    g=g_out,       # returned g from chunk_gated_delta_rule_fwd
+    beta=beta,
+    A=A,           # returned A from chunk_gated_delta_rule_fwd
+    do=do,
+    dht=None,
+    scale=None,
+    initial_state=None,
+    cu_seqlens=None,
+)
+```
+
+<Warning>
+  Pass the **returned** `g` from `chunk_gated_delta_rule_fwd` (the cumsum-transformed version), not the original input `g`. Using the wrong `g` will silently produce incorrect gradients.
+</Warning>
+
+## Parameters
+
+<ParamField path="q" type="torch.Tensor" required>
+  Query tensor of shape `[B, T, H_q, K]`, same as used in the forward pass.
+</ParamField>
+
+<ParamField path="k" type="torch.Tensor" required>
+  Key tensor of shape `[B, T, H_q, K]`, same as used in the forward pass.
+</ParamField>
+
+<ParamField path="v" type="torch.Tensor" required>
+  Value tensor of shape `[B, T, H_v, V]`, same as used in the forward pass.
+</ParamField>
+
+<ParamField path="g" type="torch.Tensor" required>
+  The **cumsum-transformed** gate tensor returned by `chunk_gated_delta_rule_fwd`, shape `[B, T, H_v]`, dtype `float32`.
+</ParamField>
+
+<ParamField path="beta" type="torch.Tensor" required>
+  Write-strength tensor of shape `[B, T, H_v]`, dtype `float32`, same as used in the forward pass.
+</ParamField>
+
+<ParamField path="A" type="torch.Tensor" required>
+  KKT solution matrix returned by `chunk_gated_delta_rule_fwd`, shape `[B, T, H_v, 64]`.
+</ParamField>
+
+<ParamField path="do" type="torch.Tensor" required>
+  Gradient of the output `o`, same shape as `o`: `[B, T, H_v, V]`.
+</ParamField>
+
+<ParamField path="dht" type="torch.Tensor | None">
+  Gradient of the final hidden state, shape `[B, H_v, K, V]`. Pass if `output_final_state=True` was used in the forward pass. Default: `None`.
+</ParamField>
+
+<ParamField path="scale" type="float | None">
+  Query scaling factor. Must match the value used in the forward pass. Defaults to `K ** -0.5`.
+</ParamField>
+
+<ParamField path="initial_state" type="torch.Tensor | None">
+  Initial recurrent state used in the forward pass. Must match the value used there. Default: `None`.
+</ParamField>
+
+<ParamField path="cu_seqlens" type="torch.LongTensor | None">
+  Cumulative sequence lengths, same as used in the forward pass. Pass the **original** `cu_seqlens`, not any modified version produced internally by auto-CP.
+</ParamField>
+
+## Returns
+
+<ResponseField name="dq" type="torch.Tensor">
+  Gradient w.r.t. `q`, same shape and dtype as `q`.
+</ResponseField>
+
+<ResponseField name="dk" type="torch.Tensor">
+  Gradient w.r.t. `k`, same shape and dtype as `k`.
+</ResponseField>
+
+<ResponseField name="dv" type="torch.Tensor">
+  Gradient w.r.t. `v`, same shape and dtype as `v`.
+</ResponseField>
+
+<ResponseField name="db" type="torch.Tensor">
+  Gradient w.r.t. `beta`, same shape as `beta`.
+</ResponseField>
+
+<ResponseField name="dg" type="torch.Tensor">
+  Gradient w.r.t. `g`, dtype `float32` regardless of input dtype.
+</ResponseField>
+
+<ResponseField name="dh0" type="torch.Tensor | None">
+  Gradient w.r.t. `initial_state`. `None` if `initial_state` was `None` in the forward pass.
+</ResponseField>
+
+## Full forward + backward example
+
+```python
+import torch
+from flash_qla import chunk_gated_delta_rule_fwd, chunk_gated_delta_rule_bwd
+
+B, T, H_q, H_v, K = 1, 4096, 64, 64, 128
+dtype = torch.bfloat16
+device = "cuda"
+
+q = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+k = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+v = torch.randn(B, T, H_v, K, dtype=dtype, device=device)
+g = torch.nn.functional.logsigmoid(
+    torch.randn(B, T, H_v, dtype=torch.float32, device=device)
+) / 16
+beta = torch.randn(B, T, H_v, dtype=torch.float32, device=device).sigmoid()
+h0 = torch.zeros(B, H_v, K, K, dtype=torch.float32, device=device)
+
+# Forward
+g_out, A, o, _, final_state = chunk_gated_delta_rule_fwd(
+    q=q, k=k, v=v, g=g, beta=beta,
+    initial_state=h0,
+    output_final_state=True,
+)
+
+# Backward
+do = torch.randn_like(o)
+dht = torch.randn_like(final_state)
+
+dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
+    q=q,
+    k=k,
+    v=v,
+    g=g_out,        # use the returned g, not original g
+    beta=beta,
+    A=A,
+    do=do,
+    dht=dht,
+    initial_state=h0,
+)
+
+print(dq.shape)   # [1, 4096, 64, 128]
+print(dg.dtype)   # torch.float32 (always)
+```

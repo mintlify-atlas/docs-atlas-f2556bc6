@@ -1,0 +1,220 @@
+---
+title: "Utility functions reference"
+description: "Reference for flash_qla.utils: sequence packing/unpacking, chunk indexing, L2 normalization, tensor result caching, and GPU kernel profiling."
+---
+
+The `flash_qla.utils` module provides helper functions for sequence manipulation, performance measurement, and internal indexing. Most are used internally by the forward/backward kernels, but several are useful for preparing inputs and analyzing performance.
+
+```python
+from flash_qla.utils import (
+    pack,
+    unpack,
+    fill_last_chunk_of_g,
+    l2norm,
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+    tensor_cache,
+    profile,
+)
+```
+
+---
+
+## pack
+
+Packs a padded batch tensor into a flat variable-length format for use with `cu_seqlens`.
+
+```python
+y = pack(x, cu_seqlens)
+```
+
+<ParamField path="x" type="torch.Tensor" required>
+  Input tensor of shape `[B, T, ...]`. Each sequence `i` occupies rows `0 : cu_seqlens[i+1] - cu_seqlens[i]` in dimension 1.
+</ParamField>
+
+<ParamField path="cu_seqlens" type="torch.Tensor" required>
+  1D cumulative sequence lengths of shape `[B + 1]`, e.g. `[0, len0, len0+len1, ...]`.
+</ParamField>
+
+Returns a tensor of shape `[1, total_tokens, ...]` where `total_tokens = cu_seqlens[-1]`.
+
+```python
+import torch
+from flash_qla.utils import pack
+
+B, max_len, H, K = 4, 2048, 32, 128
+seqlens = [512, 1024, 256, 768]
+cu_seqlens = torch.tensor([0, 512, 1536, 1792, 2560], dtype=torch.int32, device="cuda")
+
+q = torch.randn(B, max_len, H, K, dtype=torch.bfloat16, device="cuda")
+q_packed = pack(q, cu_seqlens)
+print(q_packed.shape)  # [1, 2560, 32, 128]
+```
+
+---
+
+## unpack
+
+Unpacks a flat variable-length tensor (as returned by `pack`) back into a padded batch tensor.
+
+```python
+y = unpack(x, cu_seqlens)
+```
+
+<ParamField path="x" type="torch.Tensor" required>
+  Packed tensor of shape `[1, total_tokens, ...]`. Batch size must be 1.
+</ParamField>
+
+<ParamField path="cu_seqlens" type="torch.Tensor" required>
+  1D cumulative sequence lengths of shape `[B + 1]`.
+</ParamField>
+
+Returns a tensor of shape `[B, max_len, ...]` where `max_len = max(seqlens)`. Positions beyond each sequence's length are zero-padded.
+
+```python
+from flash_qla.utils import unpack
+
+o_unpacked = unpack(o_packed, cu_seqlens)
+print(o_unpacked.shape)  # [B, max_len, H_v, K]
+```
+
+---
+
+## l2norm
+
+Applies L2 normalization along the last dimension. Used internally when `use_qk_l2norm_in_kernel=True`.
+
+```python
+y = l2norm(x, dim=-1, eps=1e-6)
+```
+
+<ParamField path="x" type="torch.Tensor" required>
+  Input tensor. The last dimension must be contiguous (`stride(-1) == 1`).
+</ParamField>
+
+<ParamField path="dim" type="int">
+  Dimension to normalize. Only `dim=-1` is supported. Default: `-1`.
+</ParamField>
+
+<ParamField path="eps" type="float">
+  Small epsilon for numerical stability. Default: `1e-6`.
+</ParamField>
+
+Returns a tensor of the same shape and dtype, with unit norm along the last dimension.
+
+```python
+from flash_qla.utils import l2norm
+
+q = torch.randn(1, 4096, 64, 128, dtype=torch.bfloat16, device="cuda")
+q_normed = l2norm(q)
+# Each [128]-dim vector now has unit L2 norm
+```
+
+---
+
+## prepare_chunk_indices
+
+Returns a 2D index tensor mapping each chunk to its `(sequence_index, local_chunk_index)`.
+
+```python
+indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+```
+
+<ParamField path="cu_seqlens" type="torch.LongTensor" required>
+  Cumulative sequence lengths, shape `[num_seqs + 1]`.
+</ParamField>
+
+<ParamField path="chunk_size" type="int" required>
+  Number of tokens per chunk. FlashQLA uses `64`.
+</ParamField>
+
+Returns a tensor of shape `[total_chunks, 2]` where each row is `[seq_idx, local_chunk_idx]`. Results are cached by input identity via `tensor_cache`.
+
+---
+
+## prepare_chunk_offsets
+
+Returns cumulative chunk offsets across sequences.
+
+```python
+offsets = prepare_chunk_offsets(cu_seqlens, chunk_size)
+```
+
+<ParamField path="cu_seqlens" type="torch.LongTensor" required>
+  Cumulative sequence lengths, shape `[num_seqs + 1]`.
+</ParamField>
+
+<ParamField path="chunk_size" type="int" required>
+  Number of tokens per chunk. FlashQLA uses `64`.
+</ParamField>
+
+Returns a tensor of shape `[num_seqs + 1]` where `offsets[i]` is the total number of chunks before sequence `i`. Uses a TileLang JIT kernel internally and caches results via `tensor_cache`.
+
+---
+
+## tensor_cache
+
+A decorator that caches the most recent 256 results of a function, keyed by input identity (not value).
+
+```python
+from flash_qla.utils import tensor_cache
+
+@tensor_cache
+def my_index_fn(cu_seqlens, chunk_size):
+    # expensive computation ...
+    return result
+```
+
+<ParamField path="fn" type="Callable" required>
+  Function to wrap. Should take tensor or scalar inputs and return tensor outputs.
+</ParamField>
+
+Returns a wrapped function that caches up to 256 recent results in an LRU-style `OrderedDict`. Useful for index/offset computations that depend on sequence shape but not on token values, avoiding repeated recomputation.
+
+<Info>
+  Caching is based on object identity (`id(x)`), not tensor values. Two different tensors with the same data will produce separate cache entries.
+</Info>
+
+---
+
+## profile
+
+Profiles a function using `torch.profiler` and returns per-kernel device times.
+
+```python
+result = profile(func, inputs, wait=50, warmup=50, rep=100)
+```
+
+<ParamField path="func" type="Callable" required>
+  The function to profile. Called as `func(*inputs)`.
+</ParamField>
+
+<ParamField path="inputs" type="list" required>
+  List of arguments to pass to `func`.
+</ParamField>
+
+<ParamField path="wait" type="int">
+  Number of warm-up iterations before profiler activates. Default: `50`.
+</ParamField>
+
+<ParamField path="warmup" type="int">
+  Number of profiler warm-up steps. Default: `50`.
+</ParamField>
+
+<ParamField path="rep" type="int">
+  Number of measured repetitions. Default: `100`.
+</ParamField>
+
+Returns a `dict` mapping kernel names to their average device time in milliseconds. Also includes a `"total"` key with end-to-end latency from `tilelang.profiler.do_bench`.
+
+```python
+from flash_qla import chunk_gated_delta_rule_fwd
+from flash_qla.utils import profile
+
+result = profile(
+    chunk_gated_delta_rule_fwd,
+    [q, k, v, g, beta, scale, None, None, True, False, True],
+)
+print(result["total"])  # total latency in ms
+# Individual kernel times keyed by TileLang kernel name
+```

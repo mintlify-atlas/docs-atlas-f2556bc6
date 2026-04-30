@@ -1,0 +1,62 @@
+---
+title: "Introduction to FlashQLA"
+description: "FlashQLA is a TileLang-powered linear attention kernel library for NVIDIA Hopper GPUs, optimized for the Gated Delta Rule operation used in Qwen models."
+---
+
+FlashQLA is a high-performance linear attention kernel library built on [TileLang](https://github.com/tile-ai/tilelang). It targets the Gated Delta Rule (GDN) Chunked Prefill operation and is designed specifically for NVIDIA Hopper (SM90) GPUs. FlashQLA was created to close the performance gap in GDN for the Qwen model family, delivering significant speedups over existing Triton-based implementations in both pretraining and agentic inference workloads.
+
+## Why FlashQLA
+
+The Gated Delta Rule is a key building block in Qwen3.5 and Qwen3.6 linear attention models. Prior implementations based on FLA Triton leave meaningful performance on the table — particularly at the head configurations used across TP1–TP8 settings. FlashQLA addresses this by combining three complementary innovations.
+
+<CardGroup cols={3}>
+  <Card title="Gate-driven auto-CP" icon="arrows-split-up-and-left">
+    Exploits the exponential decay property of the GDN gate to automatically enable intra-card context parallelism under TP, long-sequence, and small-head-count settings, improving SM utilization without manual configuration.
+  </Card>
+  <Card title="Algebraic reformulation" icon="function">
+    Reformulates the forward and backward passes of GDN Chunked Prefill to reduce Tensor Core, CUDA Core, and SFU overhead without sacrificing numerical precision.
+  </Card>
+  <Card title="Fused warp-specialized kernels" icon="microchip">
+    Uses TileLang to build fused kernels with manual warpgroup specialization that overlaps data movement, Tensor Core computation, and CUDA Core computation in a single pass.
+  </Card>
+</CardGroup>
+
+## Hardware requirements
+
+FlashQLA targets NVIDIA Hopper architecture exclusively. The table below lists the minimum versions required to build and run the library.
+
+| Requirement | Minimum version |
+|---|---|
+| GPU architecture | SM90 (NVIDIA Hopper) |
+| CUDA | 12.8 |
+| PyTorch | 2.8 |
+| Python | 3.10 |
+
+<Note>
+FlashQLA currently supports SM90 only. It will not run on Ampere (SM80), Ada Lovelace (SM89), or earlier architectures.
+</Note>
+
+## Benchmark results
+
+FlashQLA was benchmarked against FLA Triton and FlashInfer (FLA 0.5.0, Triton 3.5.1, FlashInfer 0.6.9, TileLang 0.1.8) on the head configurations used by Qwen3.5 / Qwen3.6 — `h_k,v ∈ {64, 48, 32, 24, 16, 8}`, corresponding to TP1 through TP8 — on NVIDIA H200.
+
+| Pass | Speedup over FLA Triton |
+|---|---|
+| Forward (FWD) | 2–3× |
+| Backward (BWD) | ~2× |
+
+Forward benchmarks measure single-kernel latency for different models and TP settings under varying batch lengths. Backward benchmarks examine the relationship between total token count and latency during a single update step. Full results are available in [`benchmark_results_H200.txt`](https://github.com/QwenLM/FlashQLA/blob/main/benchmark/benchmark_results_H200.txt) in the repository.
+
+## Citation
+
+If you use FlashQLA in your research, please cite:
+
+```bibtex
+@misc{flashqla2025,
+    title={FlashQLA: Flash Qwen Linear Attention},
+    author={Zhang, Chengruidong and Lin, Xi and Jiang, Huiqiang and Wang, Zekun and Li, Xiao and Cao, Yizhong and Zhuang, Bohan and Men, Rui and Zhang, Jianwei and Zheng, Bo and Lin, Junyang and Liu, Dayiheng and Zhou, Jingren},
+    year={2026},
+    publisher={GitHub},
+    howpublished={\url{https://github.com/QwenLM/FlashQLA}},
+}
+```

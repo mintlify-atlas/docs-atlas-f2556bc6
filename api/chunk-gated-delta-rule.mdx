@@ -1,0 +1,190 @@
+---
+title: "chunk_gated_delta_rule"
+description: "High-level autograd-compatible interface for GDN Chunked Prefill. Supports automatic intra-card CP, optional L2-norm QK, and variable-length sequences."
+---
+
+`chunk_gated_delta_rule` is the primary entry point for running the Gated Delta Rule (GDN) Chunked Prefill operation. It wraps the forward and backward passes in a `torch.autograd.Function` for seamless gradient support and is decorated with `@torch.compiler.disable` to ensure correct behavior with PyTorch compile.
+
+```python
+from flash_qla import chunk_gated_delta_rule
+
+o, final_state = chunk_gated_delta_rule(
+    q=q,
+    k=k,
+    v=v,
+    g=g,
+    beta=beta,
+    scale=None,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    head_first=False,
+)
+```
+
+## Parameters
+
+<ParamField path="q" type="torch.Tensor" required>
+  Query tensor of shape `[B, T, H_q, K]`. Must be `bfloat16` or `float16`.
+</ParamField>
+
+<ParamField path="k" type="torch.Tensor" required>
+  Key tensor of shape `[B, T, H_q, K]`. Must match `q` dtype.
+</ParamField>
+
+<ParamField path="v" type="torch.Tensor" required>
+  Value tensor of shape `[B, T, H_v, V]`. Must match `q` dtype. `H_v` must be divisible by `H_q` for grouped-query attention.
+</ParamField>
+
+<ParamField path="g" type="torch.Tensor" required>
+  Log-domain gate tensor of shape `[B, T, H_v]`, dtype `float32`. Typically computed as `torch.nn.functional.logsigmoid(x) / C` for some positive constant `C`. Values should be negative (log-probabilities).
+</ParamField>
+
+<ParamField path="beta" type="torch.Tensor" required>
+  Write-strength tensor of shape `[B, T, H_v]`, dtype `float32`. Typically from `torch.sigmoid(x)`, values in `[0, 1]`.
+</ParamField>
+
+<ParamField path="scale" type="float | None">
+  Query scaling factor applied before attention. Defaults to `K ** -0.5` if `None`.
+</ParamField>
+
+<ParamField path="initial_state" type="torch.Tensor | None">
+  Initial recurrent state of shape `[B, H_v, K, V]`, or `[num_seqs, H_v, K, V]` when using `cu_seqlens`. Defaults to zero state if `None`.
+</ParamField>
+
+<ParamField path="output_final_state" type="bool">
+  Whether to return the final recurrent state after processing all tokens. Default: `False`.
+</ParamField>
+
+<ParamField path="use_qk_l2norm_in_kernel" type="bool">
+  If `True`, applies L2 normalization to `q` and `k` before passing to the kernel. Default: `False`.
+</ParamField>
+
+<ParamField path="cu_seqlens" type="torch.LongTensor | None">
+  Cumulative sequence lengths for variable-length input, shape `[num_seqs + 1]`. Requires `batch_size=1`. See the [variable-length sequences guide](/guides/variable-length-sequences).
+</ParamField>
+
+<ParamField path="head_first" type="bool">
+  Not supported. Must be `False`. Raises `AssertionError` if `True`.
+</ParamField>
+
+## Returns
+
+<ResponseField name="o" type="torch.Tensor">
+  Output tensor of shape `[B, T, H_v, V]`, same dtype as `q`.
+</ResponseField>
+
+<ResponseField name="final_state" type="torch.Tensor | None">
+  Final recurrent state of shape `[B, H_v, K, V]` if `output_final_state=True`, otherwise `None`.
+</ResponseField>
+
+## Constraints
+
+<Warning>
+  `q`, `k`, and `v` must share the same dtype, and that dtype must be `bfloat16` or `float16`. `float32` is not supported and raises `AssertionError`.
+</Warning>
+
+<Warning>
+  `v.shape[2]` (`H_v`) must be divisible by `k.shape[2]` (`H_q`). This is required for grouped-query attention.
+</Warning>
+
+<Warning>
+  When using `cu_seqlens`, `batch_size` must be `1`. Flatten your batch before calling.
+</Warning>
+
+## Examples
+
+<Tabs>
+  <Tab title="Basic usage">
+    ```python
+    import torch
+    from flash_qla import chunk_gated_delta_rule
+
+    B, T, H_q, H_v, K = 1, 4096, 64, 64, 128
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    q = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+    k = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+    v = torch.randn(B, T, H_v, K, dtype=dtype, device=device)
+    g = torch.nn.functional.logsigmoid(
+        torch.randn(B, T, H_v, dtype=torch.float32, device=device)
+    ) / 16
+    beta = torch.randn(B, T, H_v, dtype=torch.float32, device=device).sigmoid()
+
+    o, _ = chunk_gated_delta_rule(q=q, k=k, v=v, g=g, beta=beta)
+    print(o.shape)  # torch.Size([1, 4096, 64, 128])
+    ```
+  </Tab>
+  <Tab title="With initial state">
+    ```python
+    import torch
+    from flash_qla import chunk_gated_delta_rule
+
+    B, T, H_q, H_v, K = 2, 2048, 32, 32, 128
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    q = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+    k = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+    v = torch.randn(B, T, H_v, K, dtype=dtype, device=device)
+    g = torch.nn.functional.logsigmoid(
+        torch.randn(B, T, H_v, dtype=torch.float32, device=device)
+    ) / 16
+    beta = torch.randn(B, T, H_v, dtype=torch.float32, device=device).sigmoid()
+    h0 = torch.zeros(B, H_v, K, K, dtype=torch.float32, device=device)
+
+    o, final_state = chunk_gated_delta_rule(
+        q=q, k=k, v=v, g=g, beta=beta,
+        initial_state=h0,
+        output_final_state=True,
+    )
+    # Pass final_state as initial_state for the next chunk (stateful inference)
+    print(final_state.shape)  # torch.Size([2, 32, 128, 128])
+    ```
+  </Tab>
+  <Tab title="With L2-norm QK">
+    ```python
+    import torch
+    from flash_qla import chunk_gated_delta_rule
+
+    # use_qk_l2norm_in_kernel=True normalizes q and k to unit norm
+    # before the kernel, which can improve training stability
+    o, _ = chunk_gated_delta_rule(
+        q=q, k=k, v=v, g=g, beta=beta,
+        use_qk_l2norm_in_kernel=True,
+    )
+    ```
+  </Tab>
+  <Tab title="With cu_seqlens">
+    ```python
+    import torch
+    from flash_qla import chunk_gated_delta_rule
+    from flash_qla.utils import pack
+
+    # 3 sequences of different lengths
+    seqlens = [1024, 2048, 512]
+    total = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0, 1024, 3072, 3584], dtype=torch.int32, device="cuda"
+    )
+
+    # Pack: q shape is [B, max_len, H, K]; pack produces [1, total, H, K]
+    B, max_len, H_q, H_v, K = 3, 2048, 32, 32, 128
+    q = pack(torch.randn(B, max_len, H_q, K, dtype=torch.bfloat16, device="cuda"), cu_seqlens)
+    k = pack(torch.randn(B, max_len, H_q, K, dtype=torch.bfloat16, device="cuda"), cu_seqlens)
+    v = pack(torch.randn(B, max_len, H_v, K, dtype=torch.bfloat16, device="cuda"), cu_seqlens)
+    g = pack(torch.nn.functional.logsigmoid(
+        torch.randn(B, max_len, H_v, dtype=torch.float32, device="cuda")) / 16, cu_seqlens)
+    beta = pack(torch.randn(B, max_len, H_v, dtype=torch.float32, device="cuda").sigmoid(), cu_seqlens)
+
+    o, final_state = chunk_gated_delta_rule(
+        q=q, k=k, v=v, g=g, beta=beta,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+    # final_state shape: [3, H_v, K, K] — one state per sequence
+    ```
+  </Tab>
+</Tabs>

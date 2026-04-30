@@ -1,0 +1,66 @@
+---
+title: "Install FlashQLA"
+description: "Install FlashQLA from source on an NVIDIA Hopper GPU using pip. The build requires CUDA 12.8+, PyTorch 2.8+, Python 3.10+, and TileLang 0.1.8."
+---
+
+FlashQLA is installed from source using pip. There are no pre-built wheels — the build process compiles the TileLang kernels for your system. The steps below assume you have a compatible NVIDIA Hopper GPU and the required software stack already in place.
+
+## Prerequisites
+
+Confirm the following are available before you begin:
+
+| Requirement | Minimum version |
+|---|---|
+| GPU architecture | SM90 (NVIDIA Hopper) |
+| CUDA | 12.8 |
+| PyTorch | 2.8 |
+| Python | 3.10 |
+
+<Warning>
+FlashQLA only supports SM90 (NVIDIA Hopper). Running on any other GPU architecture will raise a `ValueError` at import time.
+</Warning>
+
+## Installation steps
+
+<Steps>
+  <Step title="Clone the repository">
+    Clone the FlashQLA repository from GitHub and enter the project directory.
+
+    ```bash
+    git clone https://github.com/QwenLM/FlashQLA.git && cd FlashQLA
+    ```
+  </Step>
+  <Step title="Install the package">
+    Install FlashQLA in verbose mode so you can follow the build output.
+
+    ```bash
+    pip install -v .
+    ```
+
+    This installs the following dependencies alongside `flash_qla`:
+
+    | Package | Version |
+    |---|---|
+    | `torch` | ≥ 2.8 |
+    | `tilelang` | 0.1.8 |
+    | `apache-tvm-ffi` | 0.1.9 |
+  </Step>
+  <Step title="Verify the installation">
+    Confirm the package is importable and reports the expected version.
+
+    ```python
+    import flash_qla
+    print(flash_qla.__version__)
+    ```
+
+    Expected output:
+
+    ```
+    0.1.0
+    ```
+  </Step>
+</Steps>
+
+<Info>
+TileLang performs JIT compilation the first time a kernel is called. This one-time step may take up to a minute depending on your hardware. Subsequent calls use the compiled cache and run at full speed.
+</Info>

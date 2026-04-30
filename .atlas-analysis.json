@@ -1,0 +1,86 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "FlashQLA",
+  "projectDescription": "A high-performance linear attention kernel library for GDN Chunked Prefill, delivering 2-3x forward and 2x backward speedups over FLA Triton kernels on NVIDIA Hopper GPUs via TileLang-fused warp-specialized kernels.",
+  "theme": "luma",
+  "primaryColor": "#5B6CFF",
+  "lightColor": "#EEF0FF",
+  "darkColor": "#1A1D3B",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/gated-delta-rule",
+              "concepts/intra-card-cp",
+              "concepts/kernel-architecture"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/variable-length-sequences",
+              "guides/testing",
+              "guides/benchmarking"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "High-Level API",
+            "pages": [
+              "api/chunk-gated-delta-rule"
+            ]
+          },
+          {
+            "group": "Low-Level API",
+            "pages": [
+              "api/chunk-gated-delta-rule-fwd",
+              "api/chunk-gated-delta-rule-bwd"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/utils"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Gate-driven automatic intra-card context parallelism (auto-CP) exploiting GDN exponential decay",
+    "Hardware-friendly algebraic reformulation reducing Tensor Core, CUDA Core, and SFU overhead",
+    "TileLang fused warp-specialized kernels with overlapped data movement and computation",
+    "2-3x forward speedup and 2x backward speedup over FLA Triton kernel on NVIDIA Hopper (SM90)",
+    "Variable-length sequence support via cu_seqlens",
+    "BF16/FP16 support with grouped-query attention (GQA) head configurations"
+  ],
+  "publicApiSurface": [
+    "chunk_gated_delta_rule(q, k, v, g, beta, scale, initial_state, output_final_state, use_qk_l2norm_in_kernel, cu_seqlens, head_first)",
+    "chunk_gated_delta_rule_fwd(q, k, v, g, beta, scale, initial_state, cu_seqlens, output_final_state, output_h, auto_cp)",
+    "chunk_gated_delta_rule_bwd(q, k, v, g, beta, A, do, dht, scale, initial_state, cu_seqlens)",
+    "flash_qla.utils.profile(func, inputs, wait, warmup, rep)",
+    "flash_qla.utils.pack(x, cu_seqlens)",
+    "flash_qla.utils.unpack(x, cu_seqlens)",
+    "flash_qla.utils.l2norm(x)",
+    "flash_qla.utils.prepare_chunk_indices(cu_seqlens, chunk_size)",
+    "flash_qla.utils.prepare_chunk_offsets(cu_seqlens, chunk_size)",
+    "flash_qla.utils.tensor_cache(fn)"
+  ]
+}

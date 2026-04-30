@@ -1,0 +1,111 @@
+---
+title: "Intra-card context parallelism"
+description: "FlashQLA's automatic intra-card CP splits long sequences within a single GPU to improve SM utilization when head counts are small under high tensor parallelism."
+---
+
+Under high tensor parallelism (TP), the number of attention heads assigned to each GPU shrinks. When `H_v` is small — for example, 8 heads at TP8 for Qwen3.5 — there are too few independent work tiles to keep all Streaming Multiprocessors (SMs) busy during a long-sequence prefill. FlashQLA solves this with **automatic intra-card context parallelism (auto-CP)**: long sequences are split into shorter sub-sequences that can be dispatched to more SMs in parallel, then stitched back together before the main forward kernel runs.
+
+## How auto-CP works
+
+Auto-CP is handled entirely inside `chunk_gated_delta_rule_fwd` when `auto_cp=True` (the default). The preprocessing pipeline has four stages:
+
+<Steps>
+  <Step title="Determine sub-sequence length">
+    `_calc_cp_seqs` selects `max_local_chunks` — the number of 64-token chunks per sub-sequence — using the latency model below, then divides each sequence into contiguous sub-sequences of `max_local_chunks * 64` tokens.
+  </Step>
+  <Step title="Compute warmup chunks">
+    `get_warmup_chunks` scans each sub-sequence from the end, accumulating the cumulative gate `g`. It records how many trailing chunks are needed for the gate to fall below `warmup_threshold` (default `-10.0`), meaning the initial state has near-zero influence on those chunks.
+  </Step>
+  <Step title="Run state-only forward pass">
+    `fused_gdr_h` runs a state-propagation-only kernel (no output projection) over each sub-sequence to compute the boundary hidden states and correction matrices.
+  </Step>
+  <Step title="Correct initial states">
+    `correct_initial_states` propagates the user-supplied `h_0` through the boundary states to produce a corrected `cp_h0` for each sub-sequence. Sub-sequences whose warmup window covers the full sub-sequence fall back to using the propagated state directly.
+  </Step>
+</Steps>
+
+After preprocessing, the main `fused_gdr_fwd` kernel runs on the expanded set of sub-sequences with their corrected initial states, then the output is gathered back to the original sequence layout via `cp_seq_map`.
+
+## Gate-driven correctness
+
+The key insight that makes CP safe is the exponential decay of the gate. Because `g = logsigmoid(...)` is always negative, the contribution of any initial state `h_0` to the output at position `t` decays as `exp(g_0 + g_1 + ... + g_t)`. Once this cumulative sum falls below `warmup_threshold = -10.0` (i.e., the state weight is less than `exp(-10) ≈ 4.5e-5`), the precise value of `h_0` no longer meaningfully affects the output.
+
+Each sub-sequence after the first is therefore initialized with the corrected boundary state from the previous sub-sequence, and the warmup window at the tail of each sub-sequence ensures that corrections are only needed where they matter.
+
+<Info>
+The `warmup_threshold=-10.0` default is passed to `intra_card_cp_preprocess` and can be adjusted if you need stricter numerical fidelity. A threshold closer to zero (e.g., `-5.0`) enforces more warmup chunks and reduces the approximation, at the cost of more preprocessing work.
+</Info>
+
+## Latency model
+
+The optimal sub-sequence length is derived from a latency model that balances two competing costs:
+
+```
+T = a · L_cp + b · (B · H · Lc / P) / L_cp + c
+```
+
+where:
+
+- `L_cp` = `max_local_chunks` (sub-sequence length in chunks)
+- `B · H` = effective batch size × number of heads (total work tiles)
+- `Lc` = total chunks in the batch
+- `P` = `MULTI_PROCESSOR_COUNT` (number of SMs on the GPU)
+
+Minimizing over `L_cp` gives the theoretical optimum:
+
+```
+L_cp* ∝ √(B · H · Lc / P)
+```
+
+FlashQLA applies an empirical scaling factor of 3 and rounds to the nearest power of 2 for optimal SM scheduling and memory alignment:
+
+```python
+max_local_chunks = 2 ** round(
+    math.log2(math.sqrt(H * sum(num_chunks) / MULTI_PROCESSOR_COUNT) * 3)
+)
+max_local_chunks = max(max_local_chunks, 4)  # ensure multi-stage pipelining
+```
+
+The minimum of 4 chunks (256 tokens) ensures the fused forward kernel can fully pipeline its double-buffered data movement.
+
+## When CP is activated
+
+CP is only activated when the GPU's SMs would otherwise be underutilized. The condition evaluated in `_calc_cp_seqs` is:
+
+```python
+Be = sum(num_chunks) / max(num_chunks)   # effective batch size
+use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
+```
+
+`Be` is the effective batch size: for variable-length inputs, it weights shorter sequences less than longer ones. CP engages when the total parallelism `Be * H` is low enough that splitting sequences increases SM occupancy meaningfully.
+
+| Condition | CP active? |
+|-----------|-----------|
+| `Be * H > 56` | No — SMs already saturated |
+| `Be * H <= 40` | Yes — always beneficial |
+| `40 < Be * H <= 56` and sequence ≥ 8192 tokens | Yes — long-sequence regime |
+
+## Usage
+
+Auto-CP is on by default. No configuration is required:
+
+```python
+from flash_qla import chunk_gated_delta_rule_fwd
+
+# auto_cp=True is the default
+g, A, o, h, final_state = chunk_gated_delta_rule_fwd(
+    q, k, v, g, beta, scale=scale, initial_state=h0
+)
+
+# Disable auto-CP explicitly
+g, A, o, h, final_state = chunk_gated_delta_rule_fwd(
+    q, k, v, g, beta, scale=scale, initial_state=h0,
+    auto_cp=False,
+)
+```
+
+The high-level `chunk_gated_delta_rule` function always uses auto-CP through its internal call to `chunk_gated_delta_rule_fwd`.
+
+<Note>
+Auto-CP is only engaged for `batch_size=1`. For batched inputs (`batch_size > 1`), `intra_card_cp_preprocess` returns the original `h_0` and `cu_seqlens` unchanged, and the forward pass proceeds without splitting. Batched inputs naturally provide more parallelism across batch entries, so CP is not needed.
+</Note>

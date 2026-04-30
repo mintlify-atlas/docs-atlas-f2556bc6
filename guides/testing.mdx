@@ -1,0 +1,103 @@
+---
+title: "Testing FlashQLA against reference implementations"
+description: "Run FlashQLA correctness tests to compare forward and backward pass accuracy against a float64 reference and the FLA Triton baseline."
+---
+
+The FlashQLA test suite validates both the forward and backward passes of `chunk_gated_delta_rule` against two independent implementations: a pure-PyTorch reference run at high numerical precision (float64 by default) and the FLA Triton kernel from `flash_linear_attention`. Tests cover fixed-length batches, variable-length packed batches, and the full range of sequence lengths used in production model configurations.
+
+## Prerequisites
+
+The test script imports from `flash_linear_attention` for comparison. Install the pinned version before running:
+
+```bash
+pip install flash_linear_attention==0.5.0
+```
+
+## Running preset test suites
+
+All tests are driven by CSV presets stored in `tests/settings/`. Run them from the `tests/` directory:
+
+```bash
+cd tests
+
+# Quick smoke test: batch_size=1, seqlen=32768, fixed-length
+python test_gdr.py --set develop
+
+# Variable-length coverage: multiple batch sizes and sequence lengths
+python test_gdr.py --set varlen --num-heads 32
+
+# Latency profiling across seqlens 4096–32768
+python test_gdr.py --set profile --num-heads 32
+
+# Production cu_seqlens patterns, float32 reference
+python test_gdr.py --set product --ref-dtype float32 --num-heads 32
+```
+
+## Preset definitions
+
+Each preset CSV defines one or more test cases. The `--num-heads` flag overrides `num_v_heads` for every row.
+
+| Preset | Cases | Description |
+|---|---|---|
+| `develop` | 1 | Single case: `B=1`, `T=32768`, fixed-length. Fast iteration. |
+| `varlen` | 6 | Mixes fixed-length (`B=11,T=33` and `B=7,T=4321`) with variable-length (`varlen=True`) batches across a range of batch sizes and sequence lengths. |
+| `profile` | 4 | Fixed-length, `B=1`, `T` ∈ {4096, 8192, 16384, 32768}. Measures per-kernel latency. |
+| `product` | 8 | Production-realistic `cu_seqlens` patterns at `T=16384`, matching actual Qwen3.5 inference distributions. |
+
+<Note>
+  `head_dim_k`, `head_dim_v`, and `chunk_size` are fixed at 128, 128, and 64 respectively and cannot be overridden from the CLI. These are the only supported values in the current release.
+</Note>
+
+## CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--set <name>` | `develop` | Load preset from `settings/<name>.csv`. |
+| `--seqlen <N>` | `16384` | Override sequence length for all preset rows. |
+| `--num-heads <N>` | `64` | Number of V heads (`num_v_heads`). |
+| `--nkh <N>` | `0` (equals `--num-heads`) | Number of K heads (`num_k_heads`). Set to 0 to match V heads. |
+| `--no-h0` | off | Disable initial recurrent state and gradient of final state. |
+| `--skip-bwd` | off | Test the forward pass only; skip backward. |
+| `--no-cp` | off | Disable gate-driven auto intra-card context parallelism. |
+| `--swa-ratio <float>` | `0.75` | Fraction of V heads that use sliding-window (non-zero gate) attention. |
+| `--data-dtype <str>` | `bfloat16` | Input and output dtype (`bfloat16` or `float16`). |
+| `--ref-dtype <str>` | `float64` | Reference computation dtype. Use `float32` when float64 is unavailable. |
+| `--hide-acc` | off | Skip accuracy checks; print latency only. |
+| `--hide-lat` | off | Skip latency profiling; print accuracy only. |
+| `--seed <N>` | `42` | Random seed for reproducible inputs. |
+
+## Accuracy tolerance
+
+Each forward and backward tensor is checked against the high-precision reference using a 2% relative tolerance:
+
+```
+abs(output - reference) <= reference.abs().max() * 0.02
+```
+
+This check is repeated 1000 times per configuration to catch non-deterministic failures. If any iteration exceeds the tolerance the test prints a detailed error report and raises an `AssertionError`.
+
+## Output format
+
+For each test case the script prints two sections.
+
+**Accuracy report** — max absolute error relative to the reference peak for every output tensor:
+
+```
+o_fla: 0.0312 / 2.1450
+o_qla: 0.0289 / 2.1450
+```
+
+**Latency table** — per-kernel breakdown comparing FLA and FlashQLA, followed by an overall speedup:
+
+```
+                      fla  flash_qla
+[fwd] csum          0.021      0.009
+[fwd] solve         0.034      0.018
+[fwd] wu            0.112        NaN
+[fwd] gdr           0.387      0.198
+[fwd] o             0.231        NaN
+total               0.785      0.225
+Speed up: 3.49x
+```
+
+FlashQLA fuses several FLA sub-kernels (weight-update, delta-rule forward, and output projection) into a single warp-specialized kernel, which is why many FLA rows have no FlashQLA counterpart.

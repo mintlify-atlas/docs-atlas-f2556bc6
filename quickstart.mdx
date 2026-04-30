@@ -1,81 +1,129 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+description: "Run a Gated Delta Rule Chunked Prefill forward pass with FlashQLA in a few lines of Python. Covers tensor setup, the high-level API, and stateful use."
 ---
 
-## Get started in three steps
+This guide walks you through a complete forward pass using the `chunk_gated_delta_rule` high-level API. You will prepare the required input tensors, call the kernel, and inspect the output and final recurrent state.
 
-Get your documentation site running locally and make your first customization.
+<Tip>
+Use `bfloat16` or `float16` for all input tensors. FlashQLA does not support `float32` and will raise an error if you pass it.
+</Tip>
 
-### Step 1: Set up your local environment
+## Running a forward pass
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<Steps>
+  <Step title="Import and prepare tensors">
+    Import the function and create the five required input tensors. The example below uses a single sequence of length 4096 with 64 query/key heads, 64 value heads, and a head dimension of 128.
 
-### Step 2: Deploy your changes
+    ```python
+    import torch
+    from flash_qla import chunk_gated_delta_rule
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    B, T, H_q, H_v, K = 1, 4096, 64, 64, 128
+    dtype = torch.bfloat16
+    device = "cuda"
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    q    = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+    k    = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+    v    = torch.randn(B, T, H_v, K, dtype=dtype, device=device)
+    g    = torch.nn.functional.logsigmoid(
+               torch.randn(B, T, H_v, dtype=torch.float32, device=device)
+           ) / 16
+    beta = torch.randn(B, T, H_v, dtype=torch.float32, device=device).sigmoid()
+    scale = K ** -0.5
+    ```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    Tensor shapes at a glance:
 
-### Step 3: Go live
+    | Tensor | Shape | Dtype |
+    |---|---|---|
+    | `q` | `[B, T, H_q, K]` | `bfloat16` |
+    | `k` | `[B, T, H_q, K]` | `bfloat16` |
+    | `v` | `[B, T, H_v, K]` | `bfloat16` |
+    | `g` | `[B, T, H_v]` | `float32` |
+    | `beta` | `[B, T, H_v]` | `float32` |
+  </Step>
+  <Step title="Call the kernel">
+    Pass the tensors to `chunk_gated_delta_rule`. Set `output_final_state=True` to also retrieve the recurrent state at the end of the sequence.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```python
+    o, final_state = chunk_gated_delta_rule(
+        q=q, k=k, v=v, g=g, beta=beta,
+        scale=scale,
+        output_final_state=True,
+    )
+    ```
+  </Step>
+  <Step title="Inspect the output">
+    The function returns the output tensor `o` and the final recurrent state.
 
-## Next steps
+    ```python
+    print(f"Output shape:      {o.shape}")           # [1, 4096, 64, 128]
+    print(f"Final state shape: {final_state.shape}") # [1, 64, 128, 128]
+    ```
+  </Step>
+</Steps>
 
-Now that you have your docs running, explore these key features:
+## Complete example
 
-<CardGroup cols={2}>
+```python
+import torch
+from flash_qla import chunk_gated_delta_rule
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+B, T, H_q, H_v, K = 1, 4096, 64, 64, 128
+dtype = torch.bfloat16
+device = "cuda"
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+q    = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+k    = torch.randn(B, T, H_q, K, dtype=dtype, device=device)
+v    = torch.randn(B, T, H_v, K, dtype=dtype, device=device)
+g    = torch.nn.functional.logsigmoid(
+           torch.randn(B, T, H_v, dtype=torch.float32, device=device)
+       ) / 16
+beta = torch.randn(B, T, H_v, dtype=torch.float32, device=device).sigmoid()
+scale = K ** -0.5
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+o, final_state = chunk_gated_delta_rule(
+    q=q, k=k, v=v, g=g, beta=beta,
+    scale=scale,
+    output_final_state=True,
+)
+print(f"Output shape:      {o.shape}")           # [1, 4096, 64, 128]
+print(f"Final state shape: {final_state.shape}") # [1, 64, 128, 128]
+```
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+## Using L2-normalized QK
 
-</CardGroup>
+Pass `use_qk_l2norm_in_kernel=True` to have the kernel apply L2 normalization to `q` and `k` before the attention computation. This is useful when your model trains with normalized query and key projections.
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+```python
+o, final_state = chunk_gated_delta_rule(
+    q=q, k=k, v=v, g=g, beta=beta,
+    scale=scale,
+    output_final_state=True,
+    use_qk_l2norm_in_kernel=True,
+)
+```
+
+## Stateful inference with `initial_state`
+
+For autoregressive or multi-chunk inference, pass the recurrent state from one call as `initial_state` for the next. The state tensor has shape `[B, H_v, K, V]`.
+
+```python
+# First chunk
+o1, state = chunk_gated_delta_rule(
+    q=q, k=k, v=v, g=g, beta=beta,
+    scale=scale,
+    output_final_state=True,
+)
+
+# Second chunk — seed from the previous final state
+o2, state = chunk_gated_delta_rule(
+    q=q, k=k, v=v, g=g, beta=beta,
+    scale=scale,
+    initial_state=state,
+    output_final_state=True,
+)
+```
+
+For variable-length sequences packed into a single batch dimension, see the [variable-length sequences guide](/guides/variable-length-sequences).
